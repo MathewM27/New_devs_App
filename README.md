@@ -186,7 +186,51 @@ database_url = settings.database_url.replace(
 )
 ```
 
-The existing `database_url` in config is already correct for the Docker environment (`db:5432`). Converting it to the `asyncpg` driver format is all that was needed. The database now connects successfully and returns real revenue figures.
+The existing `database_url` in config is already correct for the Docker environment (`db:5432`). Converting it to the `asyncpg` driver format is all that was needed.
+
+---
+
+## Fix 4b: Session Not Usable as Async Context Manager
+
+### How We Found It
+
+After Fix 4, the DB connected successfully (`✅ Database connection pool initialized`) but revenue still showed mock data. Checking the logs revealed a new error:
+
+```
+'coroutine' object does not support the asynchronous context manager protocol
+RuntimeWarning: coroutine 'DatabasePool.get_session' was never awaited
+```
+
+Traced the issue to two problems in `reservations.py`:
+
+1. A **new `DatabasePool()` instance** was created on every request instead of using the global shared instance — so the pool was always freshly uninitialized
+2. `get_session()` returns a plain `AsyncSession`, not an async context manager — but the code used `async with db_pool.get_session()` which requires a context manager
+
+### Root Cause
+
+**File:** `backend/app/services/reservations.py` — lines 39–47
+
+```python
+# Before (broken) — creates throwaway pool, wrong session usage
+from app.core.database_pool import DatabasePool
+db_pool = DatabasePool()          # new instance, not the global one
+await db_pool.initialize()
+async with db_pool.get_session() as session:  # get_session() is not a context manager
+```
+
+### Fix
+
+```python
+# After (fixed) — use global pool instance, call session_factory directly
+from app.core.database_pool import db_pool
+
+if not db_pool.session_factory:
+    await db_pool.initialize()
+
+async with db_pool.session_factory() as session:  # session_factory() IS a context manager
+```
+
+`async_sessionmaker` returns an object that supports `async with` directly. The global `db_pool` instance is already initialized at startup so the pool is reused across requests rather than recreated every time.
 
 ---
 
@@ -197,4 +241,5 @@ The existing `database_url` in config is already correct for the Docker environm
 | 1 | Seeing another company's revenue on refresh | `services/cache.py` | 13 | Cache key only used `property_id` — shared across tenants | Add `tenant_id` to cache key |
 | 2 | Revenue off by a few cents | `api/v1/dashboard.py` | 18 | `float()` conversion loses decimal precision | Use `Decimal` instead of `float` |
 | 3 | March totals don't match internal records | `services/reservations.py` | 10–14 | Timezone-naive `datetime` mishandles UTC boundary reservations | Add `tzinfo=timezone.utc` to date range |
-| 4 | All revenue figures wrong — never matched real bookings | `core/database_pool.py` | 18 | DB connection URL built from non-existent config fields — always failed silently, serving hardcoded mock data | Use `settings.database_url` with asyncpg driver prefix |
+| 4a | All revenue figures wrong — never matched real bookings | `core/database_pool.py` | 18 | DB connection URL built from non-existent config fields — always failed silently, serving hardcoded mock data | Use `settings.database_url` with asyncpg driver prefix |
+| 4b | DB connected but still returning mock data | `services/reservations.py` | 39–47 | New `DatabasePool()` instance created per request (not the global one), and `get_session()` used as context manager when it isn't one | Import global `db_pool`, call `session_factory()` directly as context manager |
