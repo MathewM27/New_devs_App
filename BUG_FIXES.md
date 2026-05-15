@@ -43,5 +43,46 @@ Each tenant now gets their own isolated cache namespace. `revenue:tenant-a:prop-
 
 ---
 
-## Fix 2: (Pending)
+## Fix 2: Floating Point Precision Loss (Revenue Off by Cents)
+
+### Complaint
+Finance team noticed: *"Revenue totals seem slightly off by a few cents here and there."*
+
+### How We Found It
+
+1. The database schema stores revenue as `NUMERIC(10,3)` — exact decimal precision, intentional for financial data
+2. The seed data contains a deliberate precision test case:
+   ```sql
+   333.333 + 333.333 + 333.334 = 1000.000  -- exact
+   ```
+3. Traced the value from DB through the code:
+   - `calculate_total_revenue()` correctly returns the value as `str(Decimal(...))` — still precise ✓
+   - `get_revenue_summary()` stores and retrieves it as a string via Redis — still precise ✓
+   - `dashboard.py` line 18: `float(revenue_data['total'])` — **precision lost here**
+4. Python's `float` uses IEEE 754 binary representation which cannot exactly represent most decimal fractions:
+   ```python
+   float("333.333") == 333.3330000000000151...  # binary rounding error
+   ```
+   The error is tiny but compounds across multiple properties and shows up in financial reports.
+
+### Root Cause
+
+**File:** `backend/app/api/v1/dashboard.py` — line 18
+
+Converting a precise `Decimal` string to `float` at the API response layer introduced binary rounding errors.
+
+### Fix
+
+```python
+# Before (broken)
+total_revenue_float = float(revenue_data['total'])
+
+# After (fixed)
+total_revenue = str(Decimal(revenue_data['total']))
+```
+
+`Decimal` preserves exact decimal arithmetic. The value stays as a precise string through the full pipeline from DB → cache → API response, matching what clients see in their own records.
+
+---
+
 ## Fix 3: (Pending)
