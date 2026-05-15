@@ -134,6 +134,62 @@ Date boundaries are now UTC-aware, matching the `TIMESTAMP WITH TIME ZONE` colum
 
 ---
 
+---
+
+## Fix 4: Database Never Connected (Mock Data Served as Real Data)
+
+### Complaint
+All clients were seeing suspiciously round revenue numbers that didn't match their internal records — and the numbers never changed regardless of actual bookings.
+
+### How We Found It
+
+1. The API was returning `total_revenue: 1000` for prop-001 — but the seed data shows the real total should be **$2,250**
+2. Traced into `calculate_total_revenue()` in `reservations.py` — it tries the DB first, and falls into an `except` block on failure
+3. Followed into `database_pool.py` line 18 — found the connection URL being built from fields that don't exist:
+   ```python
+   # database_pool.py was trying to read these:
+   settings.supabase_db_user
+   settings.supabase_db_password
+   settings.supabase_db_host
+   settings.supabase_db_port
+   settings.supabase_db_name
+   ```
+4. Checked `config.py` — none of those fields are defined. The config only has:
+   ```python
+   database_url: str = "postgresql://postgres:postgres@db:5432/propertyflow"
+   ```
+5. Result: `initialize()` always threw an exception, `session_factory` stayed `None`, and every revenue request silently fell back to hardcoded mock data:
+   ```python
+   mock_data = {
+       'prop-001': {'total': '1000.00', 'count': 3},  # fake
+       'prop-002': {'total': '4975.50', 'count': 4},  # fake
+       ...
+   }
+   ```
+   No errors were raised — the system quietly served invented numbers as if they were real.
+
+### Root Cause
+
+**File:** `backend/app/core/database_pool.py` — line 18
+
+The connection URL was assembled from individual config fields (`supabase_db_user`, `supabase_db_host`, etc.) that were never defined in `config.py`. The correct full URL already existed as `settings.database_url` but was never used.
+
+### Fix
+
+```python
+# Before (broken) — references fields that don't exist in config
+database_url = f"postgresql+asyncpg://{settings.supabase_db_user}:{settings.supabase_db_password}@{settings.supabase_db_host}:{settings.supabase_db_port}/{settings.supabase_db_name}"
+
+# After (fixed) — use the existing database_url from config
+database_url = settings.database_url.replace(
+    "postgresql://", "postgresql+asyncpg://"
+)
+```
+
+The existing `database_url` in config is already correct for the Docker environment (`db:5432`). Converting it to the `asyncpg` driver format is all that was needed. The database now connects successfully and returns real revenue figures.
+
+---
+
 ## Summary
 
 | # | Complaint | File | Line | Root Cause | Fix |
@@ -141,3 +197,4 @@ Date boundaries are now UTC-aware, matching the `TIMESTAMP WITH TIME ZONE` colum
 | 1 | Seeing another company's revenue on refresh | `services/cache.py` | 13 | Cache key only used `property_id` — shared across tenants | Add `tenant_id` to cache key |
 | 2 | Revenue off by a few cents | `api/v1/dashboard.py` | 18 | `float()` conversion loses decimal precision | Use `Decimal` instead of `float` |
 | 3 | March totals don't match internal records | `services/reservations.py` | 10–14 | Timezone-naive `datetime` mishandles UTC boundary reservations | Add `tzinfo=timezone.utc` to date range |
+| 4 | All revenue figures wrong — never matched real bookings | `core/database_pool.py` | 18 | DB connection URL built from non-existent config fields — always failed silently, serving hardcoded mock data | Use `settings.database_url` with asyncpg driver prefix |
