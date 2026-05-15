@@ -85,4 +85,59 @@ total_revenue = str(Decimal(revenue_data['total']))
 
 ---
 
-## Fix 3: (Pending)
+## Fix 3: Timezone-Naive Datetime (Wrong Monthly Revenue Totals)
+
+### Complaint
+Sunset Properties reported: *"The revenue numbers don't match our internal records. We're showing different totals for March."*
+
+### How We Found It
+
+1. Client A (Sunset Properties) has all properties in `Europe/Paris` timezone (UTC+1)
+2. Checked `seed.sql` — found a reservation stored at the UTC month boundary:
+   ```sql
+   ('res-tz-1', 'prop-001', 'tenant-a', '2024-02-29 23:30:00+00', ...)  -- $1,250
+   ```
+3. `2024-02-29 23:30 UTC` = `2024-03-01 00:30 Europe/Paris` — Client A expects this in **March**
+4. Traced into `calculate_monthly_revenue()` in `reservations.py`:
+   ```python
+   start_date = datetime(year, month, 1)        # naive — no timezone
+   end_date   = datetime(year, month + 1, 1)    # naive — no timezone
+   ```
+5. The DB stores timestamps as `TIMESTAMP WITH TIME ZONE`. When Python sends a naive datetime in a query, PostgreSQL compares without a timezone context — the boundary comparison is inconsistent and the reservation falls outside the March range.
+6. Result: the `$1,250` reservation is excluded from March, causing totals to not match Client A's records.
+
+### Root Cause
+
+**File:** `backend/app/services/reservations.py` — lines 10–14
+
+Date range boundaries were created as timezone-naive `datetime` objects. The function also lacked a `tenant_id` parameter, which would have caused a missing variable error when the DB connection went live.
+
+### Fix
+
+```python
+# Before (broken)
+from datetime import datetime
+
+async def calculate_monthly_revenue(property_id: str, month: int, year: int, ...):
+    start_date = datetime(year, month, 1)
+    end_date   = datetime(year, month + 1, 1)
+
+# After (fixed)
+from datetime import datetime, timezone
+
+async def calculate_monthly_revenue(property_id: str, tenant_id: str, month: int, year: int, ...):
+    start_date = datetime(year, month, 1, tzinfo=timezone.utc)
+    end_date   = datetime(year, month + 1, 1, tzinfo=timezone.utc)
+```
+
+Date boundaries are now UTC-aware, matching the `TIMESTAMP WITH TIME ZONE` columns in the DB. Reservations at timezone boundaries are compared consistently, so March totals match what clients see in their own records. `tenant_id` was also added to the function signature to match the SQL query that already expected it as `$2`.
+
+---
+
+## Summary
+
+| # | Complaint | File | Line | Root Cause | Fix |
+|---|---|---|---|---|---|
+| 1 | Seeing another company's revenue on refresh | `services/cache.py` | 13 | Cache key only used `property_id` — shared across tenants | Add `tenant_id` to cache key |
+| 2 | Revenue off by a few cents | `api/v1/dashboard.py` | 18 | `float()` conversion loses decimal precision | Use `Decimal` instead of `float` |
+| 3 | March totals don't match internal records | `services/reservations.py` | 10–14 | Timezone-naive `datetime` mishandles UTC boundary reservations | Add `tzinfo=timezone.utc` to date range |
